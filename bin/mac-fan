@@ -1,0 +1,292 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 brightwalker25
+"""Mac Fan: fan profiles for mbpfan on Intel Macs, and what the fan and the
+CPU are doing.
+
+    mac-fan status              one JSON snapshot (what the panel reads)
+    mac-fan status --text       the same, for a terminal
+    mac-fan profile NAME        quiet | balanced | performance | max
+    mac-fan restore             put back the mbpfan.conf from before Mac Fan
+    mac-fan power NAME          power-saver | balanced | performance
+
+Everything the panel shows is decided here, so this runs the same with no
+compositor. Writes go through the root helper the installer puts in
+/usr/local/lib/omarchy-mac-fan, by way of `sudo -n`; if that is not set up,
+the error says so rather than prompting.
+"""
+
+import glob
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+SMC = "/sys/devices/platform/applesmc.768"
+CONF = "/etc/mbpfan.conf"
+BACKUP = "/etc/mbpfan.conf.pre-mac-fan"
+HELPER = "/usr/local/lib/omarchy-mac-fan/apply"
+HERE = os.path.dirname(os.path.realpath(__file__))
+BUNDLED = os.path.join(HERE, "..", "system", "apply")
+
+# Kept in step with system/apply by hand. The status output matches the live
+# config against these to name the profile in force.
+PROFILES = {
+    "quiet":       {"low": 60, "high": 68, "max": 86, "floor": 0.0},
+    "balanced":    {"low": 50, "high": 55, "max": 80, "floor": 0.0},
+    "performance": {"low": 45, "high": 50, "max": 72, "floor": 0.4},
+    "max":         {"low": 40, "high": 45, "max": 60, "floor": 1.0},
+}
+POWER = ["power-saver", "balanced", "performance"]
+
+
+def read(path):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+def read_int(path):
+    v = read(path)
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def fans():
+    out = []
+    for p in sorted(glob.glob(os.path.join(SMC, "fan*_input"))):
+        n = int(re.search(r"fan(\d+)_input", p).group(1))
+        rpm = read_int(p)
+        lo = read_int("%s/fan%d_min" % (SMC, n))
+        hi = read_int("%s/fan%d_max" % (SMC, n))
+        pct = None
+        if rpm is not None and lo is not None and hi and hi > lo:
+            pct = max(0, min(100, round((rpm - lo) * 100 / (hi - lo))))
+        out.append({
+            "id": n,
+            "label": (read("%s/fan%d_label" % (SMC, n)) or "Fan %d" % n).strip(),
+            "rpm": rpm,
+            "minRpm": lo,
+            "maxRpm": hi,
+            "percent": pct,
+            # 1 means software (mbpfan) is driving the fan; 0 means the SMC's
+            # own curve is, which is what you get when mbpfan is not running.
+            "manual": read("%s/fan%d_manual" % (SMC, n)) == "1",
+        })
+    return out
+
+
+def coretemp():
+    for d in glob.glob("/sys/class/hwmon/hwmon*"):
+        if read(d + "/name") != "coretemp":
+            continue
+        pkg, cores, crit = None, [], None
+        for lab in glob.glob(d + "/temp*_label"):
+            base = lab[:-len("_label")]
+            t = read_int(base + "_input")
+            if t is None:
+                continue
+            name = read(lab) or ""
+            if name.startswith("Package"):
+                pkg = t / 1000
+                c = read_int(base + "_crit")
+                crit = c / 1000 if c else None
+            else:
+                cores.append(t / 1000)
+        return {
+            "packageC": pkg,
+            "hottestCoreC": max(cores) if cores else None,
+            "critC": crit,
+        }
+    return {"packageC": None, "hottestCoreC": None, "critC": None}
+
+
+def throttle():
+    # Counts since boot. The package count is the same file under every CPU,
+    # so it is read once; the core counts are per core and summed.
+    base = "/sys/devices/system/cpu/cpu%d/thermal_throttle/"
+    pkg = read_int(base % 0 + "package_throttle_count")
+    pkg_ms = read_int(base % 0 + "package_throttle_total_time_ms")
+    core = 0
+    for p in glob.glob("/sys/devices/system/cpu/cpu*/thermal_throttle/core_throttle_count"):
+        core += read_int(p) or 0
+    return {"packageEvents": pkg, "packageMs": pkg_ms, "coreEvents": core}
+
+
+def cpu_freq():
+    vals = [read_int(p) for p in glob.glob("/sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq")]
+    vals = [v for v in vals if v]
+    top = read_int("/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq")
+    return {
+        "maxNowMhz": round(max(vals) / 1000) if vals else None,
+        "avgNowMhz": round(sum(vals) / len(vals) / 1000) if vals else None,
+        "turboMhz": round(top / 1000) if top else None,
+        "turbo": read("/sys/devices/system/cpu/intel_pstate/no_turbo") != "1",
+    }
+
+
+def parse_conf(path):
+    text = read(path)
+    if text is None:
+        return None
+    vals = {}
+    for line in text.splitlines():
+        m = re.match(r"\s*([a-z0-9_]+)\s*=\s*(-?\d+)\s*$", line)
+        if m:
+            vals[m.group(1)] = int(m.group(2))
+    return vals
+
+
+def match_profile(conf, fanlist):
+    if not conf:
+        return None
+    for name, p in PROFILES.items():
+        if (conf.get("low_temp"), conf.get("high_temp"), conf.get("max_temp")) != (p["low"], p["high"], p["max"]):
+            continue
+        ok = True
+        for f in fanlist:
+            if f["minRpm"] is None or f["maxRpm"] is None:
+                continue
+            want = f["minRpm"] + round((f["maxRpm"] - f["minRpm"]) * p["floor"])
+            have = conf.get("min_fan%d_speed" % f["id"], f["minRpm"])
+            if abs(have - want) > 1:
+                ok = False
+        if ok:
+            return name
+    return "custom"
+
+
+def systemctl_active(unit):
+    r = subprocess.run(["systemctl", "is-active", unit], capture_output=True, text=True)
+    return r.stdout.strip()
+
+
+def power_profile():
+    try:
+        r = subprocess.run(["powerprofilesctl", "get"], capture_output=True, text=True, timeout=3)
+        return r.stdout.strip() or None
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def helper_version(path):
+    # `version` is the one verb that needs no root, so this runs unprivileged.
+    if not os.path.exists(path):
+        return None
+    try:
+        r = subprocess.run(["python3", "-I", path, "version"],
+                           capture_output=True, text=True, timeout=3)
+        return r.stdout.strip() or None
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def status():
+    fl = fans()
+    conf = parse_conf(CONF)
+    t = coretemp()
+    installed = helper_version(HELPER)
+    bundled = helper_version(BUNDLED)
+    mb = systemctl_active("mbpfan")
+    warnings = []
+
+    if not fl:
+        warnings.append("No Apple SMC fan found. This plugin needs an Intel Mac with the applesmc driver.")
+    if mb != "active":
+        warnings.append("mbpfan is not running, so the Mac's firmware is driving the fan on its own curve. Choosing a profile starts it.")
+    if installed is None:
+        warnings.append("The root helper is not installed, so profiles cannot be changed from here. Run: sudo bin/mac-fan-install")
+    elif bundled and installed != bundled:
+        warnings.append("The installed helper is %s but this copy of the plugin has %s. Run the installer again." % (installed, bundled))
+
+    thr = throttle()
+    pkg = t["packageC"]
+    # Rating for the bar glyph. Throttling is judged by the panel against its
+    # own earlier reading, since a count since boot says nothing about now.
+    rating = "ok"
+    if pkg is not None and t["critC"] and pkg >= t["critC"] - 10:
+        rating = "bad"
+    elif pkg is not None and pkg >= 85:
+        rating = "warn"
+    if mb != "active" or installed is None:
+        rating = "warn" if rating == "ok" else rating
+
+    return {
+        "schemaVersion": 1,
+        "updatedAt": time.time(),
+        "fans": fl,
+        "cpu": {**t, **cpu_freq()},
+        "throttle": thr,
+        "mbpfan": {
+            "state": mb,
+            "profile": match_profile(conf, fl),
+            "lowC": conf.get("low_temp") if conf else None,
+            "highC": conf.get("high_temp") if conf else None,
+            "maxC": conf.get("max_temp") if conf else None,
+            "restorable": os.path.exists(BACKUP),
+        },
+        "power": {"profile": power_profile(), "options": POWER},
+        "helper": {"installed": installed, "bundled": bundled},
+        "rating": rating,
+        "warnings": warnings,
+    }
+
+
+def text(s):
+    out = []
+    for f in s["fans"]:
+        out.append("%s fan: %s rpm (%s%% of %s-%s)%s" % (
+            f["label"], f["rpm"], f["percent"], f["minRpm"], f["maxRpm"],
+            "" if f["manual"] else ", firmware control"))
+    c = s["cpu"]
+    out.append("CPU package: %s°C (hottest core %s°C), %s MHz now, turbo %s MHz" % (
+        c["packageC"], c["hottestCoreC"], c["maxNowMhz"], c["turboMhz"]))
+    th = s["throttle"]
+    out.append("Throttling since boot: %s package events (%s ms), %s core events" % (
+        th["packageEvents"], th["packageMs"], th["coreEvents"]))
+    m = s["mbpfan"]
+    out.append("mbpfan: %s, profile %s (%s/%s/%s°C)" % (m["state"], m["profile"], m["lowC"], m["highC"], m["maxC"]))
+    out.append("Power profile: %s" % s["power"]["profile"])
+    for w in s["warnings"]:
+        out.append("! " + w)
+    return "\n".join(out)
+
+
+def run_helper(verb):
+    if not os.path.exists(HELPER):
+        sys.exit("mac-fan: the root helper is not installed. Run: sudo %s" %
+                 os.path.join(HERE, "mac-fan-install"))
+    r = subprocess.run(["sudo", "-n", HELPER, verb], capture_output=True, text=True)
+    if r.returncode != 0:
+        msg = r.stderr.strip() or "helper exited %d" % r.returncode
+        if "password" in msg:
+            msg = "sudo wants a password for the helper, so the sudoers rule is missing or stale. Run the installer again."
+        sys.exit("mac-fan: " + msg)
+
+
+def main(argv):
+    args = [a for a in argv if not a.startswith("--")]
+    flags = [a for a in argv if a.startswith("--")]
+    cmd = args[0] if args else "status"
+    if cmd == "profile" and len(args) == 2 and args[1] in PROFILES:
+        run_helper("profile-" + args[1])
+    elif cmd == "restore" and len(args) == 1:
+        run_helper("restore")
+    elif cmd == "power" and len(args) == 2 and args[1] in POWER:
+        r = subprocess.run(["powerprofilesctl", "set", args[1]], capture_output=True, text=True)
+        if r.returncode != 0:
+            sys.exit("mac-fan: powerprofilesctl: " + (r.stderr.strip() or "failed"))
+    elif cmd != "status" or len(args) > 1:
+        sys.exit(__doc__.strip().split("\n\n")[1])
+    s = status()
+    print(text(s) if "--text" in flags else json.dumps(s))
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+#
+# Install the privileged side of Mac Fan: a root-owned helper that writes one
+# of four fixed fan profiles into /etc/mbpfan.conf, and a sudoers drop-in that
+# lets one account run that helper, with one of its fixed verbs, without a
+# password.
+#
+# A bar panel has nowhere to type a password, so this is done once, here. The
+# helper is copied rather than linked, so nothing root runs can be changed by
+# editing the plugin folder.
+#
+#   sudo bin/mac-fan-install                  install or update
+#   sudo bin/mac-fan-install --uninstall      restore mbpfan.conf, remove the helper and rule
+#   bin/mac-fan-install --dry-run             show every action, change nothing
+#   bin/mac-fan-install --print-sudoers NAME  print the rule that would be installed
+#
+# The account granted is the one that ran sudo; --user NAME chooses another.
+
+set -euo pipefail
+
+LIBDIR=/usr/local/lib/omarchy-mac-fan
+HELPER="$LIBDIR/apply"
+SUDOERS=/etc/sudoers.d/omarchy-mac-fan
+
+# The only arguments the helper accepts. system/apply holds the same list.
+VERBS=(version restore profile-quiet profile-balanced profile-performance profile-max)
+
+SRC=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
+
+die() { printf '%s\n' "$*" >&2; exit 1; }
+usage() { echo "usage: ${0##*/} [--dry-run] [--uninstall] [--user NAME] | --print-sudoers NAME" >&2; exit 2; }
+valid_user() { [[ $1 =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]; }
+
+render_sudoers() {
+  local user=$1 i last=$(( ${#VERBS[@]} - 1 ))
+  printf '# Installed by mac-fan-install for the Mac Fan bar plugin.\n'
+  printf '# Removed by mac-fan-install --uninstall. Do not edit by hand.\n'
+  printf '%s ALL=(root) NOPASSWD: \\\n' "$user"
+  for i in "${!VERBS[@]}"; do
+    if (( i < last )); then printf '    %s %s, \\\n' "$HELPER" "${VERBS[$i]}"
+    else printf '    %s %s\n' "$HELPER" "${VERBS[$i]}"; fi
+  done
+}
+
+DRY=0 UNINSTALL=0 TARGET_USER=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dry-run) DRY=1 ;;
+    --uninstall) UNINSTALL=1 ;;
+    --user) [ $# -ge 2 ] || usage; TARGET_USER="$2"; shift ;;
+    --print-sudoers)
+      [ $# -ge 2 ] || usage
+      valid_user "$2" || die "not a valid account name: $2"
+      render_sudoers "$2"; exit 0 ;;
+    *) usage ;;
+  esac
+  shift
+done
+
+if [ "$(id -u)" -ne 0 ] && [ "$DRY" -eq 0 ]; then
+  die "This has to run as root: sudo $0 (or use --dry-run to see what it would do)"
+fi
+
+run() { printf '  %s\n' "$*"; [ "$DRY" -eq 1 ] || "$@"; }
+
+if [ "$UNINSTALL" -eq 1 ]; then
+  if [ -e /etc/mbpfan.conf.pre-mac-fan ] && [ -x "$HELPER" ]; then
+    run "$HELPER" restore
+  fi
+  run rm -f "$SUDOERS"
+  run rm -rf "$LIBDIR"
+  echo
+  [ "$DRY" -eq 1 ] && echo "Dry run: nothing was changed." \
+    || echo "Put back the original /etc/mbpfan.conf and removed the helper and the sudoers rule."
+  exit 0
+fi
+
+TARGET_USER=${TARGET_USER:-${SUDO_USER:-}}
+if [ -z "$TARGET_USER" ] && [ "$DRY" -eq 1 ]; then TARGET_USER=$(id -un); fi
+[ -n "$TARGET_USER" ] || die "Cannot tell which account to grant. Run this with sudo, or pass --user NAME."
+valid_user "$TARGET_USER" || die "not a valid account name: $TARGET_USER"
+[ "$TARGET_USER" != root ] || die "Refusing to grant root; pass --user NAME."
+id -u "$TARGET_USER" >/dev/null 2>&1 || die "No such account: $TARGET_USER"
+
+[ -d /sys/devices/platform/applesmc.768 ] || die "No Apple SMC found. Mac Fan is for Intel Macs with the applesmc driver."
+[ -x /usr/bin/python3 ] || die "The helper needs /usr/bin/python3."
+command -v visudo >/dev/null || die "visudo is not installed, so the rule cannot be checked."
+
+echo "==> mbpfan"
+if ! command -v mbpfan >/dev/null; then
+  run pacman -S --needed --noconfirm mbpfan
+fi
+run systemctl enable --now mbpfan.service
+
+echo "==> helper"
+run install -d -o root -g root -m 0755 "$LIBDIR"
+run install -o root -g root -m 0755 "$SRC/system/apply" "$HELPER"
+
+echo "==> sudoers rule for $TARGET_USER"
+if [ "$DRY" -eq 1 ]; then
+  render_sudoers "$TARGET_USER" | sed 's/^/    /'
+else
+  tmp=$(mktemp /etc/sudoers.d/.omarchy-mac-fan.XXXXXX)
+  trap 'rm -f "$tmp"' EXIT
+  render_sudoers "$TARGET_USER" > "$tmp"
+  chmod 0440 "$tmp"
+  visudo -cqf "$tmp" || die "visudo rejected the rule; nothing was installed."
+  mv "$tmp" "$SUDOERS"
+  trap - EXIT
+  echo "  wrote $SUDOERS"
+fi
+
+if [ "$DRY" -eq 0 ]; then
+  echo
+  echo "Installed helper version $("$HELPER" version)."
+  echo "Nothing has changed yet: pick a profile in the panel, or run bin/mac-fan profile NAME."
+else
+  echo
+  echo "Dry run: nothing was changed."
+fi

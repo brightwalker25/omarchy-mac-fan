@@ -1,0 +1,33 @@
+{
+  "schemaVersion": 1,
+  "id": "brightwalker25.mac-fan",
+  "name": "Mac Fan",
+  "version": "0.1.0",
+  "author": "brightwalker25",
+  "license": "MIT",
+  "description": "Fan profiles for mbpfan on Intel Macs, with CPU temperature, clock and throttling alongside",
+  "kinds": ["bar-widget"],
+  "activation": "on-demand",
+  "entryPoints": { "barWidget": "BarWidget.qml" },
+  "barWidget": {
+    "displayName": "Mac Fan",
+    "description": "Quiet, Balanced, Performance and Max fan profiles for mbpfan, the power profile, and whether the CPU is throttling",
+    "category": "System",
+    "aliases": ["fan", "fans", "mbpfan", "mac", "imac", "macbook", "cooling", "performance", "thermal"],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": { "refreshIntervalMs": 2000 },
+    "schema": [
+      {
+        "key": "refreshIntervalMs",
+        "type": "integer",
+        "label": "Re-read every (ms)",
+        "min": 1000,
+        "max": 30000,
+        "step": 500,
+        "defaultValue": 2000,
+        "description": "How often the panel re-reads the fan and temperatures while it is open. While it is closed the bar glyph is refreshed once a minute."
+      }
+    ]
+  }
+}

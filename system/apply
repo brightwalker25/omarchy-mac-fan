@@ -1,0 +1,162 @@
+#!/usr/bin/python3 -I
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 brightwalker25
+"""Root helper for Mac Fan: write one of four fixed fan profiles into
+/etc/mbpfan.conf and have mbpfan reload it.
+
+Installed as /usr/local/lib/omarchy-mac-fan/apply, owned by root, and run
+through a sudoers rule that names each verb, so sudo refuses any other
+argument before this file is even read. No verb takes a value: every number
+written comes from the table below or from the fan's own limits in sysfs.
+
+The first time a profile is applied, the existing config is kept as
+/etc/mbpfan.conf.pre-mac-fan, and `restore` puts it back.
+"""
+
+import os
+import re
+import stat
+import subprocess
+import sys
+import time
+
+VERSION = "0.1.0"
+
+CONF = "/etc/mbpfan.conf"
+BACKUP = "/etc/mbpfan.conf.pre-mac-fan"
+SMC = "/sys/devices/platform/applesmc.768"
+
+# low: at or below this the fan winds back down to the floor.
+# high: above this and rising, the fan ramps up.
+# max: at or above this the fan runs flat out.
+# floor: the slowest the fan may go, as a fraction of the way from the
+# fan's own minimum to its maximum. 0 is Apple's minimum, 1 is full speed.
+#
+# Balanced is the config this machine was already running on 2026-09-25,
+# so choosing it changes nothing.
+PROFILES = {
+    "quiet":       {"low": 60, "high": 68, "max": 86, "floor": 0.0},
+    "balanced":    {"low": 50, "high": 55, "max": 80, "floor": 0.0},
+    "performance": {"low": 45, "high": 50, "max": 72, "floor": 0.4},
+    "max":         {"low": 40, "high": 45, "max": 60, "floor": 1.0},
+}
+
+VERBS = ["version", "restore"] + ["profile-" + p for p in PROFILES]
+
+
+def die(msg, code=1):
+    print("mac-fan apply: " + msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def check_self():
+    # Refuse to run from a file or folder anyone but root could have
+    # changed, since sudo would otherwise run whatever was put there.
+    if os.geteuid() != 0:
+        die("must run as root")
+    path = os.path.realpath(__file__)
+    while True:
+        st = os.stat(path)
+        if st.st_uid != 0 or st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            die("refusing to run: %s is not owned by root or is writable by others" % path)
+        if path == "/":
+            break
+        path = os.path.dirname(path)
+
+
+def read_int(name):
+    with open(os.path.join(SMC, name)) as f:
+        return int(f.read().strip())
+
+
+def fans():
+    out = []
+    for name in sorted(os.listdir(SMC)):
+        m = re.fullmatch(r"fan(\d+)_input", name)
+        if m:
+            n = int(m.group(1))
+            out.append((n, read_int("fan%d_min" % n), read_int("fan%d_max" % n)))
+    if not out:
+        die("no Apple SMC fans found under " + SMC)
+    return out
+
+
+def render(name):
+    p = PROFILES[name]
+    lines = [
+        "# Written by Mac Fan (omarchy-mac-fan), profile: %s" % name,
+        "# The original is kept in %s; `mac-fan restore` puts it back." % BACKUP,
+        "[general]",
+    ]
+    for n, lo, hi in fans():
+        floor = lo + round((hi - lo) * p["floor"])
+        lines.append("min_fan%d_speed = %d" % (n, floor))
+        lines.append("max_fan%d_speed = %d" % (n, hi))
+    lines += [
+        "low_temp = %d" % p["low"],
+        "high_temp = %d" % p["high"],
+        "max_temp = %d" % p["max"],
+        "polling_interval = 2",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def write_conf(text):
+    # A new file renamed into place, so mbpfan never reads half a config.
+    tmp = CONF + ".mac-fan-new"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644)
+    with os.fdopen(fd, "w") as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    os.rename(tmp, CONF)
+
+
+def backup_once():
+    if os.path.exists(BACKUP) or not os.path.exists(CONF):
+        return
+    if os.path.islink(CONF):
+        die("refusing: %s is a symlink" % CONF)
+    with open(CONF, "rb") as src:
+        data = src.read()
+    fd = os.open(BACKUP, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
+
+
+def reload_mbpfan():
+    # mbpfan re-reads its config on SIGHUP, which is what `reload` sends.
+    # If it is not running, start it, since a profile nobody applies is
+    # not a profile.
+    active = subprocess.run(["systemctl", "is-active", "--quiet", "mbpfan"]).returncode == 0
+    verb = "reload" if active else "start"
+    r = subprocess.run(["systemctl", verb, "mbpfan"], capture_output=True, text=True)
+    if r.returncode != 0:
+        die("systemctl %s mbpfan failed: %s" % (verb, r.stderr.strip()))
+    time.sleep(0.3)
+
+
+def main():
+    if len(sys.argv) != 2 or sys.argv[1] not in VERBS:
+        die("usage: apply {%s}" % "|".join(VERBS), 2)
+    verb = sys.argv[1]
+    if verb == "version":
+        print(VERSION)
+        return
+    check_self()
+    os.umask(0o022)
+    if verb == "restore":
+        if not os.path.exists(BACKUP):
+            die("nothing to restore: %s does not exist" % BACKUP)
+        with open(BACKUP) as f:
+            write_conf(f.read())
+        os.unlink(BACKUP)
+    else:
+        backup_once()
+        write_conf(render(verb[len("profile-"):]))
+    reload_mbpfan()
+
+
+if __name__ == "__main__":
+    main()
